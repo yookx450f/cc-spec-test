@@ -3,82 +3,135 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
-# 全角数字・全角ハイフンを半角に変換する対応表
-_TO_HALFWIDTH = str.maketrans(
-    {**{chr(0xFF10 + i): str(i) for i in range(10)}, "－": "-"}
-)
+# 2桁市外局番（この番号帯はすべて 0X-XXXX-XXXX）
+_AREA_CODES_2 = {"03", "06"}
 
-# 区切り（ハイフン・空白）。連続も許容する
-_SEP = r"[- ]*"
+# 同じ先頭3桁を持つ4桁市外局番が存在しない3桁市外局番
+# （例: 045 横浜, 052 名古屋）。ここにない固定電話は 0XXX-XX-XXXX とみなす。
+_AREA_CODES_3 = {"011", "044", "045", "052", "075", "078"}
 
-# 入力全体の表記:
-#   [+81 区切り] [(市外局番) 区切り] 数字 (区切り 数字)*
-_PHONE_RE = re.compile(
-    rf"(?P<intl>\+81{_SEP})?"
-    rf"(?:\((?P<area>[0-9]+)\){_SEP})?"
-    rf"(?P<rest>[0-9](?:{_SEP}[0-9])*)"
-)
+# 非地理的番号: (先頭, 区切り位置)
+_SPECIAL_PREFIXES = [
+    ("0120", (4, 7)),  # フリーダイヤル 0120-XXX-XXX
+    ("0570", (4, 7)),  # ナビダイヤル   0570-XXX-XXX
+    ("0800", (4, 7)),  # フリーダイヤル 0800-XXX-XXXX
+    ("050", (3, 7)),   # IP電話        050-XXXX-XXXX
+    ("070", (3, 7)),   # 携帯電話
+    ("080", (3, 7)),
+    ("090", (3, 7)),
+    ("020", (3, 7)),   # M2M など
+]
+
+_STYLES = ("hyphen", "digits", "e164")
 
 
-def normalize_phone(phone: object) -> str | None:
-    """日本の電話番号を XXX-XXXX-XXXX 形式に統一する。
+def normalize_phone(phone: str, style: str = "hyphen") -> str:
+    """日本の電話番号を統一された表記に変換する。
 
-    - 全角数字・全角ハイフンは半角に直してから判定する。
-    - 区切りはハイフン・空白を許容する。先頭の市外局番は括弧で囲んでもよい。
-    - "+81" で始まる場合は先頭を "0" に置き換える。
-    - 0 から始まる10桁または11桁でないもの、入力全体が電話番号の表記で
-      ないもの、文字列以外の入力は None を返す。
+    全角数字・各種ハイフン/空白/括弧・国番号(+81, 81)を受け付ける。
 
-    11桁は 3-4-4（XXX-XXXX-XXXX）、10桁は 2-4-4（XX-XXXX-XXXX）で区切る。
+    Args:
+        phone: 入力文字列（例: "０９０（１２３４）５６７８", "+81 90-1234-5678"）
+        style: 出力形式
+            - "hyphen": ハイフン区切りの国内表記（既定） 例: 090-1234-5678
+            - "digits": 数字のみ                         例: 09012345678
+            - "e164":   国際表記                         例: +819012345678
+
+    Returns:
+        正規化した電話番号文字列。
+
+    Raises:
+        ValueError: 電話番号として解釈できない場合、または style が不正な場合。
+
+    Note:
+        固定電話の市外局番の桁数は総務省の番号表に依存する。本関数は
+        03/06 と一部の3桁局番のみを判定し、それ以外は4桁局番として区切る。
+        厳密な区切りが必要な場合は "digits" か "e164" を使うこと。
 
     >>> normalize_phone("09012345678")
     '090-1234-5678'
-    >>> normalize_phone("０９０－１２３４－５６７８")
+    >>> normalize_phone("+81 (90) 1234-5678")
     '090-1234-5678'
-    >>> normalize_phone("(090) 1234 5678")
-    '090-1234-5678'
-    >>> normalize_phone("+81 90-1234-5678")
-    '090-1234-5678'
-    >>> normalize_phone("+81 (3) 1234-5678")
+    >>> normalize_phone("０３ー１２３４ー５６７８")
     '03-1234-5678'
-    >>> normalize_phone("0312345678")
-    '03-1234-5678'
-    >>> normalize_phone("0901234567")
-    '09-0123-4567'
-    >>> normalize_phone("090.1234.5678") is None
-    True
-    >>> normalize_phone("090)1234(5678") is None
-    True
-    >>> normalize_phone("81312345678") is None
-    True
-    >>> normalize_phone("+81 0 90 1234 5678") is None
-    True
-    >>> normalize_phone("電話は090-1234-5678です") is None
-    True
-    >>> normalize_phone("⓪⑨⓪-①②③④-⑤⑥⑦⑧") is None
-    True
-    >>> normalize_phone(9012345678) is None
-    True
+    >>> normalize_phone("0120.123.456")
+    '0120-123-456'
+    >>> normalize_phone("045 123 4567")
+    '045-123-4567'
+    >>> normalize_phone("0466-12-3456")
+    '0466-12-3456'
+    >>> normalize_phone("090-1234-5678", style="e164")
+    '+819012345678'
+    >>> normalize_phone("+81-3-1234-5678", style="digits")
+    '0312345678'
     """
+    if style not in _STYLES:
+        raise ValueError(f"style は {_STYLES} のいずれかを指定してください: {style!r}")
     if not isinstance(phone, str):
-        return None
+        raise ValueError(f"文字列を指定してください: {phone!r}")
 
-    s = phone.translate(_TO_HALFWIDTH)
-    m = _PHONE_RE.fullmatch(s)
-    if m is None:
-        return None
+    # 全角→半角（数字・記号・空白）
+    s = unicodedata.normalize("NFKC", phone).strip()
 
-    digits = (m["area"] or "") + re.sub(r"[- ]", "", m["rest"])
-    if m["intl"]:
+    # 区切り文字として許容するもの以外が含まれていたらエラー
+    if not re.fullmatch(r"\+?[0-9\s\-‐‑‒–—―−ー().]+", s):
+        raise ValueError(f"電話番号として解釈できない文字が含まれています: {phone!r}")
+
+    has_plus = s.startswith("+")
+    digits = re.sub(r"\D", "", s)
+
+    # 国番号 81 を国内表記の 0 に変換
+    if has_plus or (digits.startswith("81") and len(digits) in (11, 12)):
+        if not digits.startswith("81"):
+            raise ValueError(f"日本(+81)以外の国番号には対応していません: {phone!r}")
+        digits = digits[2:]
+        if digits.startswith("0"):  # "+81 (0)90..." のような表記
+            digits = digits[1:]
         digits = "0" + digits
 
-    if not digits.startswith("0") or len(digits) not in (10, 11):
-        return None
+    _validate(digits, phone)
 
-    if len(digits) == 11:
-        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+    if style == "digits":
+        return digits
+    if style == "e164":
+        return "+81" + digits[1:]
+    return _hyphenate(digits)
+
+
+def _validate(digits: str, original: str) -> None:
+    if not digits.startswith("0") or digits.startswith("00"):
+        raise ValueError(f"日本の電話番号として不正です: {original!r}")
+    if digits.startswith("0800"):
+        expected = 11
+    elif digits.startswith(("0120", "0570")):
+        expected = 10
+    elif digits.startswith(("020", "050", "070", "080", "090")):
+        expected = 11
+    else:
+        expected = 10
+    if len(digits) != expected:
+        raise ValueError(
+            f"桁数が不正です（{expected}桁のはずが{len(digits)}桁）: {original!r}"
+        )
+
+
+def _split(digits: str, cuts: tuple[int, int]) -> str:
+    a, b = cuts
+    return f"{digits[:a]}-{digits[a:b]}-{digits[b:]}"
+
+
+def _hyphenate(digits: str) -> str:
+    for prefix, cuts in _SPECIAL_PREFIXES:
+        if digits.startswith(prefix):
+            return _split(digits, cuts)
+    # 固定電話（10桁）: 市外局番 + 市内局番 = 6桁、加入者番号 = 4桁
+    if digits[:2] in _AREA_CODES_2:
+        return _split(digits, (2, 6))
+    if digits[:3] in _AREA_CODES_3:
+        return _split(digits, (3, 6))
+    return _split(digits, (4, 6))
 
 
 if __name__ == "__main__":
